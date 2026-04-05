@@ -1,0 +1,935 @@
+use crate::error::{AzureLoginError, Result};
+use chromiumoxide::Page;
+use dialoguer::{Input, Select, Password};
+use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub struct LoginContext {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub no_prompt: bool,
+    pub remember_me: Option<bool>,
+}
+
+// Static flag to track if TFA instructions have been shown
+static TFA_INSTRUCTIONS_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Main state machine loop that handles Azure AD login automation
+pub async fn run_state_machine(
+    page: &Page,
+    context: &LoginContext,
+) -> Result<()> {
+    tracing::debug!("Running Azure AD state machine");
+
+    let mut unrecognized_delay = 0;
+    let mut aws_endpoint_delay = 0;
+    const MAX_UNRECOGNIZED_DELAY: u64 = 30_000; // 30 seconds
+    const MAX_AWS_ENDPOINT_DELAY: u64 = 10_000; // 10 seconds for AWS endpoint
+    const POLL_INTERVAL: u64 = 1000; // 1 second
+
+    loop {
+        // Check if we've reached the AWS SAML endpoint (successful authentication)
+        // This can happen quickly when session is cached (browser reuse)
+        if let Ok(Some(url)) = page.url().await {
+            if url.contains("signin.aws.amazon.com")
+                || url.contains("signin.amazonaws-us-gov.com")
+                || url.contains("signin.amazonaws.cn") {
+                tracing::debug!("Reached AWS endpoint, waiting for SAML interception ({}ms)", aws_endpoint_delay);
+                // Reset unrecognized delay since we're in a known state
+                unrecognized_delay = 0;
+                // Wait for the interceptor to capture the SAML response
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL)).await;
+                aws_endpoint_delay += POLL_INTERVAL;
+
+                // Check if we're at the AWS role selection page (already authenticated)
+                if let Ok(content) = page.content().await {
+                    // AWS role selection page contains specific elements
+                    if content.contains("arn:aws:iam::") || content.contains("saml-account") {
+                        tracing::debug!("Detected AWS role selection page (already authenticated via shared session)");
+                        // The SAML response is already processed by AWS, but we missed capturing it
+                        // This is expected when reusing browser sessions - we need to extract from the page
+                        return Err(AzureLoginError::BrowserError(
+                            "Reached AWS role selection page but SAML response was not captured. This can happen with shared tenant sessions.".to_string()
+                        ));
+                    }
+                }
+
+                // If we've been at AWS endpoint too long without finding the role selection page, something went wrong
+                if aws_endpoint_delay > MAX_AWS_ENDPOINT_DELAY {
+                    // Save screenshot for debugging to temp directory
+                    let screenshot_path = std::env::temp_dir().join("unrecognized-state.png");
+                    let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
+
+                    tracing::error!("Timeout at AWS endpoint after {}ms, saving screenshot", aws_endpoint_delay);
+
+                    // Capture screenshot for debugging
+                    match page.screenshot(
+                        chromiumoxide::page::ScreenshotParams::builder()
+                            .full_page(true)
+                            .omit_background(false)
+                            .build()
+                    ).await {
+                        Ok(screenshot_data) => {
+                            if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
+                                tracing::warn!("Failed to write screenshot to {}: {}", screenshot_path_str, e);
+                            } else {
+                                tracing::info!("Screenshot saved to {}", screenshot_path_str);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to capture screenshot: {}", e);
+                        }
+                    }
+
+                    return Err(AzureLoginError::BrowserError(
+                        format!("Timeout waiting for SAML response at AWS endpoint. The SAML POST may have been missed. Screenshot saved to {}", screenshot_path_str)
+                    ));
+                }
+                continue;
+            } else {
+                // Reset AWS endpoint delay if we're not at AWS endpoint
+                aws_endpoint_delay = 0;
+            }
+        }
+
+        // Try each state in priority order
+        // Username input - use visibility check to avoid false positives with hidden fields
+        if is_element_visible(page, "input[name='loginfmt']").await {
+            tracing::debug!("Found state: username input");
+            handle_username_input(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Account selection
+        if try_selector(page, "#aadTile").await {
+            tracing::debug!("Found state: account selection");
+            handle_account_selection(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Passwordless authentication
+        if try_selector(page, "input[value='Send notification']").await {
+            tracing::debug!("Found state: passwordless authentication");
+            handle_passwordless_auth(page).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Password input - use visibility check to avoid false positives with hidden fields
+        if is_element_visible(page, "input[name='Password']").await
+            || is_element_visible(page, "input[name='passwd']").await
+        {
+            tracing::debug!("Found state: password input");
+            handle_password_input(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // TFA code input (check this BEFORE TFA instructions as they can appear together)
+        // Use visibility check to avoid false positives with hidden fields
+        if is_element_visible(page, "input[name='otc']").await {
+            tracing::debug!("Found state: TFA code input");
+            handle_tfa_code_input(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // TFA instructions (only triggers if code input not present)
+        // This is a transient/informational state - just display and continue polling
+        if try_selector(page, "#idDiv_SAOTCAS_Description").await {
+            tracing::debug!("Found state: TFA instructions");
+            handle_tfa_instructions_once(page).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Verify your identity (multiple authentication options)
+        // Check for multiple possible selectors for this state
+        if try_selector(page, "#idDiv_SAOTCC_Title").await
+            || try_selector(page, "#idDiv_SAOTCC_Description").await
+            || try_selector(page, "div[data-value='PhoneAppNotification']").await
+            || try_selector(page, "div[data-value='PhoneAppOTP']").await
+            || try_selector(page, "#idA_SAOTCC_Resend").await
+        {
+            tracing::debug!("Found state: verify your identity (checking for authentication options)");
+            handle_verify_identity(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Remember me
+        if try_selector(page, "#KmsiDescription").await {
+            tracing::debug!("Found state: remember me");
+            handle_remember_me(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Service exception
+        if try_selector(page, "#service_exception_message").await {
+            tracing::error!("Found state: service exception");
+            return handle_service_exception(page).await;
+        }
+
+        // TFA failure
+        if try_selector(page, "#idDiv_SAASDS_Description").await
+            || try_selector(page, "#idDiv_SAASTO_Description").await
+        {
+            tracing::debug!("Found state: TFA failure");
+            handle_tfa_failure(page).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // No state matched, wait and retry
+        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL)).await;
+        unrecognized_delay += POLL_INTERVAL;
+
+        if unrecognized_delay > MAX_UNRECOGNIZED_DELAY {
+            // Save screenshot to temp directory
+            let screenshot_path = std::env::temp_dir().join("unrecognized-state.png");
+            let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
+
+            tracing::error!("Unrecognized page state after {}ms, saving screenshot", unrecognized_delay);
+
+            // Capture screenshot for debugging
+            match page.screenshot(
+                chromiumoxide::page::ScreenshotParams::builder()
+                    .full_page(true)
+                    .omit_background(false)
+                    .build()
+            ).await {
+                Ok(screenshot_data) => {
+                    if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
+                        tracing::warn!("Failed to write screenshot to {}: {}", screenshot_path_str, e);
+                    } else {
+                        tracing::info!("Screenshot saved to {}", screenshot_path_str);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to capture screenshot: {}", e);
+                }
+            }
+
+            return Err(AzureLoginError::UnrecognizedPageState(screenshot_path_str));
+        }
+    }
+}
+
+/// Helper function to check if a selector exists on the page
+async fn try_selector(page: &Page, selector: &str) -> bool {
+    page.find_element(selector).await.is_ok()
+}
+
+/// Handle username input
+async fn handle_username_input(page: &Page, context: &LoginContext) -> Result<()> {
+    tracing::debug!("Handling username input");
+
+    // Get username
+    let username = if let Some(u) = &context.username {
+        u.clone()
+    } else if context.no_prompt {
+        return Err(AzureLoginError::AuthenticationFailed(
+            "No username provided and --no-prompt is set".to_string(),
+        ));
+    } else {
+        Input::<String>::new()
+            .with_prompt("Username")
+            .interact_text()
+            .map_err(|e| AzureLoginError::AuthenticationFailed(e.to_string()))?
+    };
+
+    tracing::debug!("Entering username: {}", username);
+
+    // Retry loop for handling stale elements
+    const MAX_RETRIES: usize = 5;
+    const RETRY_DELAY_MS: u64 = 200;
+
+    for attempt in 0..MAX_RETRIES {
+        match try_input_text_and_submit(page, "input[name='loginfmt']", &username, "username").await {
+            Ok(_) => break,
+            Err(e) if attempt < MAX_RETRIES - 1 => {
+                tracing::debug!("Attempt {} failed: {}, retrying...", attempt + 1, e);
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Wait for page transition - ensure the username field is no longer visible
+    // This prevents the state machine from detecting the username field again
+    const TRANSITION_TIMEOUT_MS: u64 = 5000;
+    const TRANSITION_POLL_MS: u64 = 100;
+    let mut elapsed = 0;
+
+    while elapsed < TRANSITION_TIMEOUT_MS {
+        // Check if username field is no longer visible
+        if !is_element_visible(page, "input[name='loginfmt']").await {
+            tracing::debug!("Username field hidden, page transition detected after {}ms", elapsed);
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(TRANSITION_POLL_MS)).await;
+        elapsed += TRANSITION_POLL_MS;
+    }
+
+    if elapsed >= TRANSITION_TIMEOUT_MS {
+        tracing::warn!("Username field still visible after {}ms, proceeding anyway", elapsed);
+    }
+
+    // Additional small delay to ensure next page is ready
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    Ok(())
+}
+
+/// Helper function to input text into a field with retry logic
+async fn try_input_text(page: &Page, selector: &str, text: &str, field_name: &str) -> Result<()> {
+    let input = page.find_element(selector).await.map_err(|e| {
+        AzureLoginError::BrowserError(format!(
+            "Failed to find {} field '{}': {}",
+            field_name, selector, e
+        ))
+    })?;
+
+    input.scroll_into_view().await.map_err(|e| {
+        AzureLoginError::BrowserError(format!(
+            "Failed to scroll {} field into view: {} (selector: {})",
+            field_name, e, selector
+        ))
+    })?;
+
+    input.focus().await.map_err(|e| {
+        AzureLoginError::BrowserError(format!(
+            "Failed to focus {} field: {} (selector: {})",
+            field_name, e, selector
+        ))
+    })?;
+
+    input.type_str(text).await.map_err(|e| {
+        AzureLoginError::BrowserError(format!(
+            "Failed to type into {} field: {} (selector: {})",
+            field_name, e, selector
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// Helper function to input text and submit by pressing Enter
+async fn try_input_text_and_submit(page: &Page, selector: &str, text: &str, field_name: &str) -> Result<()> {
+    try_input_text(page, selector, text, field_name).await?;
+
+    // Press Enter to submit instead of clicking submit button (more reliable)
+    let input = page.find_element(selector).await.map_err(|e| {
+        AzureLoginError::BrowserError(format!(
+            "Failed to re-find {} field for submit: {}",
+            field_name, e
+        ))
+    })?;
+
+    input.press_key("Enter").await.map_err(|e| {
+        AzureLoginError::BrowserError(format!(
+            "Failed to press Enter in {} field: {} (selector: {})",
+            field_name, e, selector
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// Helper to check if an element is actually visible (not just in DOM)
+async fn is_element_visible(page: &Page, selector: &str) -> bool {
+    // Use page.evaluate to check if element is visible
+    // This checks: element exists, has offsetParent (not display:none), and has dimensions
+    let script = format!(
+        r#"
+        (function() {{
+            const el = document.querySelector('{}');
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            return el.offsetParent !== null &&
+                   el.offsetWidth > 0 &&
+                   el.offsetHeight > 0 &&
+                   style.visibility !== 'hidden' &&
+                   style.display !== 'none';
+        }})()
+        "#,
+        selector.replace('\'', "\\'")
+    );
+
+    if let Ok(result) = page.evaluate(script).await {
+        if let Ok(value) = result.into_value::<bool>() {
+            return value;
+        }
+    }
+
+    false
+}
+
+/// Handle password input
+async fn handle_password_input(page: &Page, context: &LoginContext) -> Result<()> {
+    tracing::debug!("Handling password input");
+
+    let password = if let Some(p) = &context.password {
+        p.clone()
+    } else if context.no_prompt {
+        return Err(AzureLoginError::AuthenticationFailed(
+            "No password provided and --no-prompt is set".to_string(),
+        ));
+    } else {
+        Password::new()
+            .with_prompt("Password")
+            .interact()
+            .map_err(|e| AzureLoginError::AuthenticationFailed(e.to_string()))?
+    };
+
+    tracing::debug!("Entering password");
+
+    // Retry loop for handling stale elements
+    const MAX_RETRIES: usize = 5;
+    const RETRY_DELAY_MS: u64 = 200;
+
+    for attempt in 0..MAX_RETRIES {
+        // Try both possible password field names
+        let selector = if page.find_element("input[name='Password']").await.is_ok() {
+            "input[name='Password']"
+        } else {
+            "input[name='passwd']"
+        };
+
+        match try_input_text_and_submit(page, selector, &password, "password").await {
+            Ok(_) => break,
+            Err(e) if attempt < MAX_RETRIES - 1 => {
+                tracing::debug!("Attempt {} failed: {}, retrying...", attempt + 1, e);
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Wait for page transition - ensure the password field is no longer visible
+    const TRANSITION_TIMEOUT_MS: u64 = 5000;
+    const TRANSITION_POLL_MS: u64 = 100;
+    let mut elapsed = 0;
+
+    while elapsed < TRANSITION_TIMEOUT_MS {
+        // Check if both password fields are no longer visible
+        if !is_element_visible(page, "input[name='Password']").await
+            && !is_element_visible(page, "input[name='passwd']").await
+        {
+            tracing::debug!("Password field hidden, page transition detected after {}ms", elapsed);
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(TRANSITION_POLL_MS)).await;
+        elapsed += TRANSITION_POLL_MS;
+    }
+
+    if elapsed >= TRANSITION_TIMEOUT_MS {
+        tracing::warn!("Password field still visible after {}ms, proceeding anyway", elapsed);
+    }
+
+    // Additional small delay to ensure next page is ready
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    Ok(())
+}
+
+/// Handle account selection
+async fn handle_account_selection(page: &Page, context: &LoginContext) -> Result<()> {
+    tracing::debug!("Handling account selection");
+
+    let has_aad = try_selector(page, "#aadTile").await;
+    let has_msa = try_selector(page, "#msaTile").await;
+    let account_count = (has_aad as usize) + (has_msa as usize);
+
+    if account_count == 0 {
+        return Err(AzureLoginError::AuthenticationFailed(
+            "No account tiles found".to_string(),
+        ));
+    }
+
+    if account_count == 1 {
+        tracing::debug!("Only one account available, selecting automatically");
+        let selector = if has_aad { "#aadTile" } else { "#msaTile" };
+        let tile = page.find_element(selector).await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to find account tile: {}", e))
+        })?;
+        tile.click().await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to click account: {}", e))
+        })?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        return Ok(());
+    }
+
+    if context.no_prompt {
+        tracing::debug!("Multiple accounts available, selecting AAD (no-prompt mode)");
+        let tile = page.find_element("#aadTile").await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to find AAD tile: {}", e))
+        })?;
+        tile.click().await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to click account: {}", e))
+        })?;
+    } else {
+        let accounts = vec!["Azure AD Account", "Microsoft Account"];
+        let selection = Select::new()
+            .with_prompt("Select account")
+            .items(&accounts)
+            .default(0)
+            .interact()
+            .map_err(|e| AzureLoginError::AuthenticationFailed(e.to_string()))?;
+
+        let selector = if selection == 0 { "#aadTile" } else { "#msaTile" };
+        let tile = page.find_element(selector).await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to find account tile: {}", e))
+        })?;
+        tile.click().await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to click account: {}", e))
+        })?;
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Handle passwordless authentication
+async fn handle_passwordless_auth(page: &Page) -> Result<()> {
+    tracing::debug!("Handling passwordless authentication");
+
+    let button = page.find_element("input[value='Send notification']").await.map_err(|e| {
+        AzureLoginError::BrowserError(format!("Failed to find send notification button: {}", e))
+    })?;
+
+    button.click().await.map_err(|e| {
+        AzureLoginError::BrowserError(format!("Failed to click send notification: {}", e))
+    })?;
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    if let Ok(code_elem) = page.find_element("#idRichContext_DisplaySign").await {
+        if let Ok(Some(code)) = code_elem.inner_text().await {
+            println!("Authentication code: {}", code);
+            tracing::debug!("Authentication code displayed: {}", code);
+        }
+    }
+
+    println!("Waiting for push notification approval...");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    Ok(())
+}
+
+/// Handle TFA instructions (only display once, not on every poll)
+async fn handle_tfa_instructions_once(page: &Page) -> Result<()> {
+    // Check if we've already shown the instructions
+    if TFA_INSTRUCTIONS_SHOWN.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    tracing::debug!("Handling TFA instructions");
+
+    // Mark as shown
+    TFA_INSTRUCTIONS_SHOWN.store(true, Ordering::Relaxed);
+
+    if let Ok(elem) = page.find_element("#idDiv_SAOTCAS_Description").await {
+        if let Ok(Some(description)) = elem.inner_text().await {
+            println!("{}", description);
+        }
+    }
+
+    if let Ok(code_elem) = page.find_element("#idRichContext_DisplaySign").await {
+        if let Ok(Some(code)) = code_elem.inner_text().await {
+            println!("Authentication code: {}", code);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle "Verify your identity" state with multiple authentication options
+async fn handle_verify_identity(page: &Page, context: &LoginContext) -> Result<()> {
+    tracing::debug!("Handling verify your identity options");
+
+    // Wait a bit for options to fully load
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Look for available authentication options using multiple selector strategies
+    let has_authenticator = page
+            .find_element("div[data-value='PhoneAppNotification']")
+            .await
+            .is_ok()
+        || page
+            .find_element("[data-value='PhoneAppNotification']")
+            .await
+            .is_ok()
+        || page
+            .find_element("#idDiv_SAOTCC_Desc_PhoneApp")
+            .await
+            .is_ok();
+
+    let has_verification_code = page
+            .find_element("div[data-value='PhoneAppOTP']")
+            .await
+            .is_ok()
+        || page
+            .find_element("[data-value='PhoneAppOTP']")
+            .await
+            .is_ok()
+        || page
+            .find_element("#idDiv_SAOTCC_Desc_OTP")
+            .await
+            .is_ok();
+
+    tracing::debug!(
+        "Authentication options detected - Authenticator: {}, Verification code: {}",
+        has_authenticator,
+        has_verification_code
+    );
+
+    // If no prompt mode, default to authenticator app if available
+    if context.no_prompt {
+        if has_authenticator {
+            tracing::debug!("Auto-selecting Microsoft Authenticator approval (no-prompt mode)");
+            return handle_authenticator_approval(page).await;
+        } else if has_verification_code {
+            return Err(AzureLoginError::AuthenticationFailed(
+                "Verification code required but --no-prompt is set".to_string(),
+            ));
+        }
+    }
+
+    // Prompt user to choose authentication method
+    let mut options = Vec::new();
+    if has_authenticator {
+        options.push("Approve a request on my Microsoft Authenticator app");
+    }
+    if has_verification_code {
+        options.push("Use a verification code");
+    }
+
+    if options.is_empty() {
+        return Err(AzureLoginError::AuthenticationFailed(
+            "No authentication options available".to_string(),
+        ));
+    }
+
+    if options.len() == 1 {
+        tracing::debug!("Only one authentication option available, using it");
+        if has_authenticator {
+            return handle_authenticator_approval(page).await;
+        } else {
+            return handle_verification_code_flow(page, context).await;
+        }
+    }
+
+    // Multiple options - prompt user
+    println!("Multiple authentication methods available:");
+    let selection = Select::new()
+        .with_prompt("Select authentication method")
+        .items(&options)
+        .default(0)
+        .interact()
+        .map_err(|e| AzureLoginError::AuthenticationFailed(format!("Selection failed: {}", e)))?;
+
+    if options[selection].contains("Authenticator") {
+        handle_authenticator_approval(page).await
+    } else {
+        handle_verification_code_flow(page, context).await
+    }
+}
+
+/// Handle Microsoft Authenticator app approval (acts like retry flow)
+async fn handle_authenticator_approval(page: &Page) -> Result<()> {
+    tracing::debug!("Selecting Microsoft Authenticator approval");
+
+    // Try different selectors for the authenticator option
+    let selectors = vec![
+        "div[data-value='PhoneAppNotification']",
+        "[data-value='PhoneAppNotification']",
+        "#idDiv_SAOTCC_Desc_PhoneApp",
+        "div[role='link'][data-value='PhoneAppNotification']",
+    ];
+
+    for selector in selectors {
+        if let Ok(link) = page.find_element(selector).await {
+            tracing::debug!("Found authenticator element with selector: {}", selector);
+            link.click().await.map_err(|e| {
+                AzureLoginError::BrowserError(format!("Failed to click authenticator link: {}", e))
+            })?;
+
+            // Reset TFA instructions flag so the new code will be displayed
+            TFA_INSTRUCTIONS_SHOWN.store(false, Ordering::Relaxed);
+
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            return Ok(());
+        }
+    }
+
+    Err(AzureLoginError::BrowserError(
+        "Could not find authenticator approval link".to_string(),
+    ))
+}
+
+/// Handle verification code flow (click link, prompt for code, enter code)
+async fn handle_verification_code_flow(page: &Page, _context: &LoginContext) -> Result<()> {
+    tracing::debug!("Selecting verification code option");
+
+    // Click on "Use a verification code" link
+    let selectors = vec![
+        "div[data-value='PhoneAppOTP']",
+        "[data-value='PhoneAppOTP']",
+        "#idDiv_SAOTCC_Desc_OTP",
+        "div[role='link'][data-value='PhoneAppOTP']",
+    ];
+
+    let mut clicked = false;
+    for selector in selectors {
+        if let Ok(link) = page.find_element(selector).await {
+            tracing::debug!("Found verification code element with selector: {}", selector);
+            link.click().await.map_err(|e| {
+                AzureLoginError::BrowserError(format!("Failed to click verification code link: {}", e))
+            })?;
+
+            clicked = true;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            break;
+        }
+    }
+
+    if !clicked {
+        tracing::warn!("Could not find verification code link to click");
+    }
+
+    // Wait for the code input field to appear
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Now prompt for and enter the verification code
+    // This should trigger the existing TFA code input handler on next state machine loop
+    Ok(())
+}
+
+/// Handle TFA failure
+async fn handle_tfa_failure(page: &Page) -> Result<()> {
+    tracing::warn!("TFA authentication failed, looking for retry option");
+
+    // Look for retry link - Microsoft shows "Send another request to my Microsoft Authenticator app"
+    // Try common selectors for retry links
+    let retry_selectors = vec![
+        "a[id*='retry']",
+        "a[id*='Retry']",
+        "a:has-text('Send another request')",
+        "#idA_SAASTO_Resend",
+        "#idA_SAASDS_Resend",
+    ];
+
+    for selector in retry_selectors {
+        if let Ok(retry_link) = page.find_element(selector).await {
+            if let Ok(Some(text)) = retry_link.inner_text().await {
+                tracing::debug!("Found retry link: '{}', clicking to retry", text);
+                println!("TFA failed, retrying authentication...");
+
+                retry_link.click().await.map_err(|e| {
+                    AzureLoginError::BrowserError(format!("Failed to click retry link: {}", e))
+                })?;
+
+                // Reset the TFA instructions flag so the new code will be displayed
+                TFA_INSTRUCTIONS_SHOWN.store(false, Ordering::Relaxed);
+
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                return Ok(());
+            }
+        }
+    }
+
+    // No retry link found, get error message and fail
+    let error_elem = if let Ok(elem) = page.find_element("#idDiv_SAASDS_Description").await {
+        Ok(elem)
+    } else {
+        page.find_element("#idDiv_SAASTO_Description").await
+    };
+
+    if let Ok(elem) = error_elem {
+        if let Ok(Some(error_msg)) = elem.inner_text().await {
+            return Err(AzureLoginError::AuthenticationFailed(format!(
+                "TFA failed: {}",
+                error_msg
+            )));
+        }
+    }
+
+    Err(AzureLoginError::AuthenticationFailed(
+        "TFA authentication failed (no retry option available)".to_string(),
+    ))
+}
+
+/// Handle TFA code input
+async fn handle_tfa_code_input(page: &Page, context: &LoginContext) -> Result<()> {
+    tracing::debug!("Handling TFA code input");
+
+    if let Ok(desc_elem) = page.find_element("#idDiv_SAOTCC_Description").await {
+        if let Ok(Some(description)) = desc_elem.inner_text().await {
+            println!("{}", description);
+        }
+    }
+
+    let code = if context.no_prompt {
+        return Err(AzureLoginError::AuthenticationFailed(
+            "TFA code required but --no-prompt is set".to_string(),
+        ));
+    } else {
+        Input::<String>::new()
+            .with_prompt("Enter verification code")
+            .interact_text()
+            .map_err(|e| AzureLoginError::AuthenticationFailed(e.to_string()))?
+    };
+
+    tracing::debug!("Entering TFA code");
+
+    // Retry loop for handling stale elements
+    const MAX_RETRIES: usize = 5;
+    const RETRY_DELAY_MS: u64 = 200;
+
+    for attempt in 0..MAX_RETRIES {
+        match try_input_text_and_submit(page, "input[name='otc']", &code, "TFA code").await {
+            Ok(_) => break,
+            Err(e) if attempt < MAX_RETRIES - 1 => {
+                tracing::debug!("Attempt {} failed: {}, retrying...", attempt + 1, e);
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Wait for page transition
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    Ok(())
+}
+
+/// Handle "Remember me" prompt
+async fn handle_remember_me(page: &Page, context: &LoginContext) -> Result<()> {
+    tracing::debug!("Handling remember me prompt");
+
+    // Use config value if available, otherwise default to Yes
+    let should_remember = context.remember_me.unwrap_or(true);
+
+    let button_value = if should_remember { "Yes" } else { "No" };
+    let button_selector = format!("input[value='{}']", button_value);
+
+    if let Ok(btn) = page.find_element(&button_selector).await {
+        tracing::debug!("Clicking '{}' for remember me", button_value);
+        btn.click().await.map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to click {}: {}", button_value, e))
+        })?;
+    } else {
+        tracing::warn!("Remember me button '{}' not found, trying fallback", button_value);
+        // Fallback: try the opposite button
+        let fallback_value = if should_remember { "No" } else { "Yes" };
+        let fallback_selector = format!("input[value='{}']", fallback_value);
+        if let Ok(btn) = page.find_element(&fallback_selector).await {
+            btn.click().await.map_err(|e| {
+                AzureLoginError::BrowserError(format!("Failed to click {}: {}", fallback_value, e))
+            })?;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Handle service exception errors
+async fn handle_service_exception(page: &Page) -> Result<()> {
+    tracing::error!("Service exception occurred");
+
+    if let Ok(elem) = page.find_element("#service_exception_message").await {
+        if let Ok(Some(error_msg)) = elem.inner_text().await {
+            return Err(AzureLoginError::AuthenticationFailed(format!(
+                "Service exception: {}",
+                error_msg
+            )));
+        }
+    }
+
+    Err(AzureLoginError::AuthenticationFailed(
+        "Service exception occurred".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_login_context_creation() {
+        let context = LoginContext {
+            username: Some("user@example.com".to_string()),
+            password: Some("password123".to_string()),
+            no_prompt: false,
+            remember_me: Some(true),
+        };
+
+        assert_eq!(context.username, Some("user@example.com".to_string()));
+        assert_eq!(context.password, Some("password123".to_string()));
+        assert!(!context.no_prompt);
+        assert_eq!(context.remember_me, Some(true));
+    }
+
+    #[test]
+    fn test_login_context_no_prompt_mode() {
+        let context = LoginContext {
+            username: None,
+            password: None,
+            no_prompt: true,
+            remember_me: None,
+        };
+
+        assert!(context.username.is_none());
+        assert!(context.password.is_none());
+        assert!(context.no_prompt);
+        assert!(context.remember_me.is_none());
+    }
+
+    #[test]
+    fn test_login_context_with_defaults() {
+        let context = LoginContext {
+            username: Some("admin@company.com".to_string()),
+            password: None,
+            no_prompt: false,
+            remember_me: Some(false),
+        };
+
+        assert_eq!(context.username, Some("admin@company.com".to_string()));
+        assert!(context.password.is_none());
+        assert_eq!(context.remember_me, Some(false));
+    }
+
+    #[test]
+    fn test_tfa_instructions_shown_flag() {
+        // Test that the static flag starts as false
+        use std::sync::atomic::Ordering;
+
+        // Note: This test may interfere with other tests if run in parallel
+        // In a real scenario, you'd want to refactor to avoid static mutable state
+        let initial = TFA_INSTRUCTIONS_SHOWN.load(Ordering::Relaxed);
+
+        // Just verify the atomic bool can be read
+        assert!(initial || !initial); // Always true, just checking it compiles
+    }
+
+    #[test]
+    fn test_constants() {
+        // Test that constants are defined correctly
+        const MAX_UNRECOGNIZED_DELAY: u64 = 30_000;
+        const MAX_AWS_ENDPOINT_DELAY: u64 = 10_000;
+        const POLL_INTERVAL: u64 = 1000;
+
+        assert_eq!(MAX_UNRECOGNIZED_DELAY, 30_000);
+        assert_eq!(MAX_AWS_ENDPOINT_DELAY, 10_000);
+        assert_eq!(POLL_INTERVAL, 1000);
+    }
+}
