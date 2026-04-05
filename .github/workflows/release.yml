@@ -286,6 +286,13 @@ jobs:
       - name: Display artifact structure
         run: ls -R artifacts/
 
+      - name: Set executable permissions on binaries
+        run: |
+          chmod +x artifacts/linux-x86_64/aws-azure-saml
+          chmod +x artifacts/linux-arm64/aws-azure-saml
+          chmod +x artifacts/macos-x86_64/aws-azure-saml
+          chmod +x artifacts/macos-arm64/aws-azure-saml
+
       - name: Create ZIP archives
         run: |
           cd artifacts
