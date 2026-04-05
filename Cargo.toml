@@ -40,6 +40,9 @@ scraper = "0.21"
 # HTTP client (for proxy support)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
+# OpenSSL (vendored for cross-compilation)
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
 # SAML encoding/decoding
 base64 = "0.22"
 flate2 = "1.0"
