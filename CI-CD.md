@@ -14,13 +14,32 @@ The pipeline has three stages:
 
 The pipeline builds binaries for:
 
-| Platform | Architecture | Target Triple | File Name |
-|----------|-------------|---------------|-----------|
-| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `aws-azure-saml-linux-x86_64` |
-| Linux | ARM64 | `aarch64-unknown-linux-gnu` | `aws-azure-saml-linux-arm64` |
-| Windows | x86_64 | `x86_64-pc-windows-gnu` | `aws-azure-saml-windows-x86_64.exe` |
-| macOS | Intel x86_64 | `x86_64-apple-darwin` | `aws-azure-saml-macos-x86_64` |
-| macOS | Apple Silicon (ARM64) | `aarch64-apple-darwin` | `aws-azure-saml-macos-arm64` |
+| Platform | Architecture | Target Triple | Artifact Path |
+|----------|-------------|---------------|---------------|
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `artifacts/linux-x86_64/aws-azure-saml` |
+| Linux | ARM64 | `aarch64-unknown-linux-gnu` | `artifacts/linux-arm64/aws-azure-saml` |
+| Windows | x86_64 | `x86_64-pc-windows-gnu` | `artifacts/windows-x86_64/aws-azure-saml.exe` |
+| macOS | Intel x86_64 | `x86_64-apple-darwin` | `artifacts/macos-x86_64/aws-azure-saml` |
+| macOS | Apple Silicon (ARM64) | `aarch64-apple-darwin` | `artifacts/macos-arm64/aws-azure-saml` |
+
+### Artifact Structure
+
+Artifacts are organized in platform-specific folders:
+```
+artifacts/
+├── linux-x86_64/
+│   └── aws-azure-saml
+├── linux-arm64/
+│   └── aws-azure-saml
+├── windows-x86_64/
+│   └── aws-azure-saml.exe
+├── macos-x86_64/
+│   └── aws-azure-saml
+└── macos-arm64/
+    └── aws-azure-saml
+```
+
+This structure keeps the binary name consistent across platforms while organizing by platform type.
 
 ## Creating a Release
 
