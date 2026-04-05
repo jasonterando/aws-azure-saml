@@ -113,6 +113,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+          # Add ARM64 architecture for installing ARM64 packages
+          sudo dpkg --add-architecture arm64
+
+          # Update package lists with new architecture
+          sudo apt-get update
+
+          # Install ARM64 OpenSSL development libraries
+          sudo apt-get install -y libssl-dev:arm64
+
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
@@ -127,6 +136,8 @@ jobs:
       - name: Build binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_SYSROOT_DIR: /
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
         run: |
           cargo build --release --target aarch64-unknown-linux-gnu
           aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/aws-azure-saml || true
@@ -186,10 +197,10 @@ jobs:
           path: artifacts/windows-x86_64/
           retention-days: 7
 
-  # Build for macOS x86_64 (Intel)
+  # Build for macOS x86_64 (Intel) - cross-compiled from Apple Silicon
   build-macos-x86_64:
     name: Build macOS x86_64
-    runs-on: macos-13  # Intel runner
+    runs-on: macos-14  # Apple Silicon runner, cross-compile to x86_64
     environment: Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
