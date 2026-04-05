@@ -98,7 +98,8 @@ pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()
                         aws_endpoint_delay
                     );
 
-                    let screenshot_path = save_debug_screenshot(page, "unrecognized-state.png").await;
+                    let screenshot_path =
+                        save_debug_screenshot(page, "unrecognized-state.png").await;
 
                     return Err(AzureLoginError::BrowserError(
                         format!("Timeout waiting for SAML response at AWS endpoint. The SAML POST may have been missed. Screenshot saved to {}", screenshot_path)
