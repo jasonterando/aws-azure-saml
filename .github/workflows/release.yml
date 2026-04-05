@@ -13,6 +13,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # Run tests on all commits to main and PRs
@@ -108,19 +109,8 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
 
-      - name: Install cross-compilation tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-          # Add ARM64 architecture for installing ARM64 packages
-          sudo dpkg --add-architecture arm64
-
-          # Update package lists with new architecture
-          sudo apt-get update
-
-          # Install ARM64 OpenSSL development libraries
-          sudo apt-get install -y libssl-dev:arm64
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -133,14 +123,9 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_SYSROOT_DIR: /
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+      - name: Build binary with cross
         run: |
-          cargo build --release --target aarch64-unknown-linux-gnu
-          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/aws-azure-saml || true
+          cross build --release --target aarch64-unknown-linux-gnu
           mkdir -p artifacts/linux-arm64
           cp target/aarch64-unknown-linux-gnu/release/aws-azure-saml artifacts/linux-arm64/
           chmod +x artifacts/linux-arm64/aws-azure-saml
