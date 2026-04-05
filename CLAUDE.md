@@ -79,7 +79,15 @@ Credentials are only refreshed if expiration time is within 11 minutes, preventi
 7. Write to ~/.aws/credentials with expiration timestamp
 
 ### Multi-Profile Support
-The `--all-profiles` flag reads all [profile *] sections from ~/.aws/config that contain azure_tenant_id, then logs into each sequentially using the same browser instance.
+The `--all-profiles` flag reads all [profile *] sections from ~/.aws/config that contain azure_tenant_id, then logs into each using browser session reuse where appropriate. Browser sessions are grouped by both tenant_id AND username - profiles with the same tenant but different usernames will use separate browser sessions to avoid authentication conflicts.
+
+### Signal Handling
+The application implements graceful Ctrl-C handling using tokio::select! to intercept SIGINT signals. When interrupted, it gives browser processes 500ms to clean up before exiting with exit code 130 (standard for SIGINT). This prevents orphaned browser processes, especially on Windows.
+
+### State Machine Enhancements
+- **Password prompts** display the username when it was auto-filled from config (azure_default_username), helping users identify which account they're authenticating to
+- **Screenshot capture** on unrecognized states saves debug screenshots to temp directory (unrecognized-state.png) for troubleshooting
+- **Centralized screenshot helper** eliminates code duplication for debug screenshot capture
 
 ## Code Conventions
 

@@ -309,8 +309,9 @@ pub async fn login_all(cli: &Cli) -> Result<()> {
     let aws_config = AwsConfig::new();
     let profiles = aws_config.get_all_profile_names()?;
 
-    // Group profiles by Azure tenant ID to reuse browser sessions
-    let mut tenant_groups: std::collections::HashMap<String, Vec<String>> =
+    // Group profiles by (tenant_id, username) to reuse browser sessions
+    // This ensures profiles with different usernames don't share sessions
+    let mut tenant_groups: std::collections::HashMap<(String, Option<String>), Vec<String>> =
         std::collections::HashMap::new();
 
     for profile in profiles {
@@ -326,26 +327,30 @@ pub async fn login_all(cli: &Cli) -> Result<()> {
             continue;
         }
 
-        // Get tenant ID for grouping
+        // Get tenant ID and username for grouping
         let profile_config = aws_config.get_profile_config(&profile)?;
-        tenant_groups
-            .entry(profile_config.azure_tenant_id.clone())
-            .or_default()
-            .push(profile);
+        let group_key = (
+            profile_config.azure_tenant_id.clone(),
+            profile_config.azure_default_username.clone(),
+        );
+        tenant_groups.entry(group_key).or_default().push(profile);
     }
 
     // Process each tenant group with a shared browser session
-    for (tenant_id, profiles_in_tenant) in tenant_groups {
+    for ((tenant_id, username), profiles_in_tenant) in tenant_groups {
+        let username_display = username.as_deref().unwrap_or("<not specified>");
         tracing::debug!(
-            "Reusing browser session for {} profile(s) in tenant {}",
+            "Reusing browser session for {} profile(s) in tenant {} with username {}",
             profiles_in_tenant.len(),
-            &tenant_id[..8.min(tenant_id.len())]
+            &tenant_id[..8.min(tenant_id.len())],
+            username_display
         );
 
         tracing::debug!(
-            "Processing {} profile(s) for tenant '{}' with shared browser session",
+            "Processing {} profile(s) for tenant '{}' (username: '{}') with shared browser session",
             profiles_in_tenant.len(),
-            tenant_id
+            tenant_id,
+            username_display
         );
 
         // Launch browser once for this tenant
