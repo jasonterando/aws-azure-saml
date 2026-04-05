@@ -1,8 +1,8 @@
+mod aws;
+mod azure;
 mod cli;
 mod config;
 mod error;
-mod aws;
-mod azure;
 mod prompts;
 
 use clap::Parser;
@@ -44,7 +44,10 @@ async fn main() {
             std::process::exit(2);
         }
         Err(AzureLoginError::MissingAzureConfig(ref profile)) => {
-            eprintln!("Error: Profile '{}' is missing required Azure configuration.", profile);
+            eprintln!(
+                "Error: Profile '{}' is missing required Azure configuration.",
+                profile
+            );
             eprintln!("Run with --configure to add Azure settings to the profile.");
             std::process::exit(2);
         }

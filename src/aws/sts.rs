@@ -1,9 +1,9 @@
-use crate::config::ProfileCredentials;
-use crate::config::credentials::set_profile_credentials;
-use crate::error::{AzureLoginError, Result};
 use crate::aws::saml::AwsRole;
-use aws_sdk_sts::Client as StsClient;
+use crate::config::credentials::set_profile_credentials;
+use crate::config::ProfileCredentials;
+use crate::error::{AzureLoginError, Result};
 use aws_config::BehaviorVersion;
+use aws_sdk_sts::Client as StsClient;
 use chrono::{DateTime, Utc};
 
 pub async fn assume_role_with_saml(
@@ -65,9 +65,9 @@ pub async fn assume_role_with_saml(
 
     // Convert AWS DateTime to chrono DateTime
     use aws_smithy_types::date_time::Format;
-    let expiration_str = expiration.fmt(Format::DateTime).map_err(|e| {
-        AzureLoginError::StsError(format!("Failed to format expiration: {}", e))
-    })?;
+    let expiration_str = expiration
+        .fmt(Format::DateTime)
+        .map_err(|e| AzureLoginError::StsError(format!("Failed to format expiration: {}", e)))?;
     let expiration_dt: DateTime<Utc> = DateTime::parse_from_rfc3339(&expiration_str)
         .map_err(|e| AzureLoginError::StsError(format!("Failed to parse expiration: {}", e)))?
         .into();

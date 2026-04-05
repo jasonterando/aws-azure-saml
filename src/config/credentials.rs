@@ -1,6 +1,6 @@
-use crate::error::{AzureLoginError, Result};
 use crate::config::Paths;
-use chrono::{DateTime, Utc, Duration};
+use crate::error::{AzureLoginError, Result};
+use chrono::{DateTime, Duration, Utc};
 use ini::Ini;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -77,7 +77,10 @@ pub fn is_profile_about_to_expire(profile_name: &str) -> Result<bool> {
     let section = match ini.section(Some(profile_name)) {
         Some(s) => s,
         None => {
-            tracing::debug!("Profile '{}' not found in credentials, treating as expired", profile_name);
+            tracing::debug!(
+                "Profile '{}' not found in credentials, treating as expired",
+                profile_name
+            );
             return Ok(true);
         }
     };
@@ -85,7 +88,10 @@ pub fn is_profile_about_to_expire(profile_name: &str) -> Result<bool> {
     let expiration_str = match section.get("aws_expiration") {
         Some(exp) => exp,
         None => {
-            tracing::debug!("No expiration found for profile '{}', treating as expired", profile_name);
+            tracing::debug!(
+                "No expiration found for profile '{}', treating as expired",
+                profile_name
+            );
             return Ok(true);
         }
     };
@@ -94,7 +100,10 @@ pub fn is_profile_about_to_expire(profile_name: &str) -> Result<bool> {
     let expiration_date = match DateTime::parse_from_rfc3339(expiration_str) {
         Ok(dt) => dt.with_timezone(&Utc),
         Err(_) => {
-            tracing::warn!("Could not parse expiration date '{}', treating as expired", expiration_str);
+            tracing::warn!(
+                "Could not parse expiration date '{}', treating as expired",
+                expiration_str
+            );
             return Ok(true);
         }
     };

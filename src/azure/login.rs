@@ -1,9 +1,9 @@
-use crate::cli::Cli;
-use crate::config::{AwsConfig, is_profile_about_to_expire};
-use crate::error::{AzureLoginError, Result};
+use crate::aws::{assume_role_with_saml, create_saml_request, parse_saml_response, AwsRole};
 use crate::azure::browser::{launch_browser, BrowserOptions};
 use crate::azure::state_machine::{run_state_machine, LoginContext};
-use crate::aws::{create_saml_request, parse_saml_response, assume_role_with_saml, AwsRole};
+use crate::cli::Cli;
+use crate::config::{is_profile_about_to_expire, AwsConfig};
+use crate::error::{AzureLoginError, Result};
 use dialoguer::Select;
 
 // AWS SAML endpoints
@@ -28,7 +28,10 @@ async fn login_async_with_browser(
     cli: &Cli,
     browser: &chromiumoxide::Browser,
 ) -> Result<()> {
-    tracing::debug!("Logging in to profile '{}' with existing browser", profile_name);
+    tracing::debug!(
+        "Logging in to profile '{}' with existing browser",
+        profile_name
+    );
 
     // Load profile configuration
     let aws_config = AwsConfig::new();
@@ -78,13 +81,14 @@ async fn login_async_with_browser(
     tracing::debug!("Network monitoring enabled");
 
     // Parse remember_me config value
-    let remember_me = profile_config.azure_default_remember_me.as_ref().and_then(|s| {
-        match s.to_lowercase().as_str() {
+    let remember_me = profile_config
+        .azure_default_remember_me
+        .as_ref()
+        .and_then(|s| match s.to_lowercase().as_str() {
             "true" | "yes" | "1" => Some(true),
             "false" | "no" | "0" => Some(false),
             _ => None,
-        }
-    });
+        });
 
     // Create login context for state machine
     let login_context = LoginContext {
@@ -95,7 +99,8 @@ async fn login_async_with_browser(
     };
 
     // Set up SAML interceptor with navigation - this ensures the event listener is subscribed before navigation
-    let saml_response = intercept_saml_with_navigation(&page, saml_endpoint, &login_url, &login_context).await?;
+    let saml_response =
+        intercept_saml_with_navigation(&page, saml_endpoint, &login_url, &login_context).await?;
 
     tracing::debug!("SAML response captured");
 
@@ -140,7 +145,9 @@ async fn intercept_saml_with_navigation(
     let mut events = page
         .event_listener::<EventRequestWillBeSent>()
         .await
-        .map_err(|e| AzureLoginError::BrowserError(format!("Failed to subscribe to events: {}", e)))?;
+        .map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to subscribe to events: {}", e))
+        })?;
 
     tracing::debug!("Event listener subscribed, navigating to {}", login_url);
 
@@ -158,9 +165,7 @@ async fn intercept_saml_with_navigation(
             no_prompt: login_context.no_prompt,
             remember_me: login_context.remember_me,
         };
-        async move {
-            run_state_machine(&page_clone, &context_clone).await
-        }
+        async move { run_state_machine(&page_clone, &context_clone).await }
     });
 
     // Wait for SAML POST while state machine runs
@@ -226,13 +231,18 @@ async fn intercept_saml_response(page: &chromiumoxide::Page, endpoint: &str) -> 
     use chromiumoxide::cdp::browser_protocol::network::EventRequestWillBeSent;
     use futures::StreamExt;
 
-    tracing::debug!("Starting SAML response interception for endpoint: {}", endpoint);
+    tracing::debug!(
+        "Starting SAML response interception for endpoint: {}",
+        endpoint
+    );
 
     // Subscribe to network request events
     let mut events = page
         .event_listener::<EventRequestWillBeSent>()
         .await
-        .map_err(|e| AzureLoginError::BrowserError(format!("Failed to subscribe to events: {}", e)))?;
+        .map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to subscribe to events: {}", e))
+        })?;
 
     while let Some(event) = events.next().await {
         let request_url = &event.request.url;
@@ -248,7 +258,10 @@ async fn intercept_saml_response(page: &chromiumoxide::Page, endpoint: &str) -> 
             // Wait a bit for the POST data to be available
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            if let Ok(post_data_result) = page.execute(GetRequestPostDataParams::new(request_id)).await {
+            if let Ok(post_data_result) = page
+                .execute(GetRequestPostDataParams::new(request_id))
+                .await
+            {
                 tracing::debug!("Extracting SAML response from POST data");
                 return parse_saml_from_post(&post_data_result.post_data);
             } else {
@@ -285,7 +298,8 @@ pub async fn login_all(cli: &Cli) -> Result<()> {
     let profiles = aws_config.get_all_profile_names()?;
 
     // Group profiles by Azure tenant ID to reuse browser sessions
-    let mut tenant_groups: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut tenant_groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for profile in profiles {
         // Check if profile has Azure config
@@ -339,7 +353,11 @@ pub async fn login_all(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn select_role(roles: &[AwsRole], profile_config: &crate::config::ProfileConfig, no_prompt: bool) -> Result<AwsRole> {
+fn select_role(
+    roles: &[AwsRole],
+    profile_config: &crate::config::ProfileConfig,
+    no_prompt: bool,
+) -> Result<AwsRole> {
     if roles.len() == 1 {
         return Ok(roles[0].clone());
     }
@@ -371,12 +389,17 @@ fn select_role(roles: &[AwsRole], profile_config: &crate::config::ProfileConfig,
         .items(&role_names)
         .default(0)
         .interact()
-        .map_err(|e| AzureLoginError::AuthenticationFailed(format!("Role selection failed: {}", e)))?;
+        .map_err(|e| {
+            AzureLoginError::AuthenticationFailed(format!("Role selection failed: {}", e))
+        })?;
 
     Ok(roles[selection].clone())
 }
 
-fn determine_duration(profile_config: &crate::config::ProfileConfig, no_prompt: bool) -> Result<u32> {
+fn determine_duration(
+    profile_config: &crate::config::ProfileConfig,
+    no_prompt: bool,
+) -> Result<u32> {
     // Check if there's a valid duration configured
     if let Some(duration_str) = &profile_config.azure_default_duration_hours {
         if let Ok(hours) = duration_str.parse::<u32>() {
@@ -409,7 +432,9 @@ fn determine_duration(profile_config: &crate::config::ProfileConfig, no_prompt: 
             }
         })
         .interact_text()
-        .map_err(|e| AzureLoginError::AuthenticationFailed(format!("Duration input failed: {}", e)))?;
+        .map_err(|e| {
+            AzureLoginError::AuthenticationFailed(format!("Duration input failed: {}", e))
+        })?;
 
     Ok(duration_str.parse().unwrap())
 }

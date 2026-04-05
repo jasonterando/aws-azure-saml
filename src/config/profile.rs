@@ -1,5 +1,5 @@
-use crate::error::{AzureLoginError, Result};
 use crate::config::Paths;
+use crate::error::{AzureLoginError, Result};
 use ini::Ini;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -116,20 +116,32 @@ impl AwsConfig {
         // Required fields
         let azure_tenant_id = match section.get("azure_tenant_id") {
             Some(v) => v.to_string(),
-            None => return Err(AzureLoginError::MissingAzureConfig(profile_name.to_string())),
+            None => {
+                return Err(AzureLoginError::MissingAzureConfig(
+                    profile_name.to_string(),
+                ))
+            }
         };
 
         let azure_app_id_uri = match section.get("azure_app_id_uri") {
             Some(v) => v.to_string(),
-            None => return Err(AzureLoginError::MissingAzureConfig(profile_name.to_string())),
+            None => {
+                return Err(AzureLoginError::MissingAzureConfig(
+                    profile_name.to_string(),
+                ))
+            }
         };
 
         // Optional fields
         let azure_default_username = section.get("azure_default_username").map(|s| s.to_string());
         let azure_default_password = section.get("azure_default_password").map(|s| s.to_string());
         let azure_default_role_arn = section.get("azure_default_role_arn").map(|s| s.to_string());
-        let azure_default_duration_hours = section.get("azure_default_duration_hours").map(|s| s.to_string());
-        let azure_default_remember_me = section.get("azure_default_remember_me").map(|s| s.to_string());
+        let azure_default_duration_hours = section
+            .get("azure_default_duration_hours")
+            .map(|s| s.to_string());
+        let azure_default_remember_me = section
+            .get("azure_default_remember_me")
+            .map(|s| s.to_string());
         let region = section.get("region").map(|s| s.to_string());
 
         Ok(ProfileConfig {

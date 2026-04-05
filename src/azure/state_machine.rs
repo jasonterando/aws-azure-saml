@@ -1,8 +1,8 @@
 use crate::error::{AzureLoginError, Result};
 use chromiumoxide::Page;
-use dialoguer::{Input, Select, Password};
-use std::time::Duration;
+use dialoguer::{Input, Password, Select};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub struct LoginContext {
     pub username: Option<String>,
@@ -15,10 +15,7 @@ pub struct LoginContext {
 static TFA_INSTRUCTIONS_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Main state machine loop that handles Azure AD login automation
-pub async fn run_state_machine(
-    page: &Page,
-    context: &LoginContext,
-) -> Result<()> {
+pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()> {
     tracing::debug!("Running Azure AD state machine");
 
     let mut unrecognized_delay = 0;
@@ -33,8 +30,12 @@ pub async fn run_state_machine(
         if let Ok(Some(url)) = page.url().await {
             if url.contains("signin.aws.amazon.com")
                 || url.contains("signin.amazonaws-us-gov.com")
-                || url.contains("signin.amazonaws.cn") {
-                tracing::debug!("Reached AWS endpoint, waiting for SAML interception ({}ms)", aws_endpoint_delay);
+                || url.contains("signin.amazonaws.cn")
+            {
+                tracing::debug!(
+                    "Reached AWS endpoint, waiting for SAML interception ({}ms)",
+                    aws_endpoint_delay
+                );
                 // Reset unrecognized delay since we're in a known state
                 unrecognized_delay = 0;
                 // Wait for the interceptor to capture the SAML response
@@ -60,18 +61,28 @@ pub async fn run_state_machine(
                     let screenshot_path = std::env::temp_dir().join("unrecognized-state.png");
                     let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
 
-                    tracing::error!("Timeout at AWS endpoint after {}ms, saving screenshot", aws_endpoint_delay);
+                    tracing::error!(
+                        "Timeout at AWS endpoint after {}ms, saving screenshot",
+                        aws_endpoint_delay
+                    );
 
                     // Capture screenshot for debugging
-                    match page.screenshot(
-                        chromiumoxide::page::ScreenshotParams::builder()
-                            .full_page(true)
-                            .omit_background(false)
-                            .build()
-                    ).await {
+                    match page
+                        .screenshot(
+                            chromiumoxide::page::ScreenshotParams::builder()
+                                .full_page(true)
+                                .omit_background(false)
+                                .build(),
+                        )
+                        .await
+                    {
                         Ok(screenshot_data) => {
                             if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
-                                tracing::warn!("Failed to write screenshot to {}: {}", screenshot_path_str, e);
+                                tracing::warn!(
+                                    "Failed to write screenshot to {}: {}",
+                                    screenshot_path_str,
+                                    e
+                                );
                             } else {
                                 tracing::info!("Screenshot saved to {}", screenshot_path_str);
                             }
@@ -153,7 +164,9 @@ pub async fn run_state_machine(
             || try_selector(page, "div[data-value='PhoneAppOTP']").await
             || try_selector(page, "#idA_SAOTCC_Resend").await
         {
-            tracing::debug!("Found state: verify your identity (checking for authentication options)");
+            tracing::debug!(
+                "Found state: verify your identity (checking for authentication options)"
+            );
             handle_verify_identity(page, context).await?;
             unrecognized_delay = 0;
             continue;
@@ -192,18 +205,28 @@ pub async fn run_state_machine(
             let screenshot_path = std::env::temp_dir().join("unrecognized-state.png");
             let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
 
-            tracing::error!("Unrecognized page state after {}ms, saving screenshot", unrecognized_delay);
+            tracing::error!(
+                "Unrecognized page state after {}ms, saving screenshot",
+                unrecognized_delay
+            );
 
             // Capture screenshot for debugging
-            match page.screenshot(
-                chromiumoxide::page::ScreenshotParams::builder()
-                    .full_page(true)
-                    .omit_background(false)
-                    .build()
-            ).await {
+            match page
+                .screenshot(
+                    chromiumoxide::page::ScreenshotParams::builder()
+                        .full_page(true)
+                        .omit_background(false)
+                        .build(),
+                )
+                .await
+            {
                 Ok(screenshot_data) => {
                     if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
-                        tracing::warn!("Failed to write screenshot to {}: {}", screenshot_path_str, e);
+                        tracing::warn!(
+                            "Failed to write screenshot to {}: {}",
+                            screenshot_path_str,
+                            e
+                        );
                     } else {
                         tracing::info!("Screenshot saved to {}", screenshot_path_str);
                     }
@@ -248,7 +271,8 @@ async fn handle_username_input(page: &Page, context: &LoginContext) -> Result<()
     const RETRY_DELAY_MS: u64 = 200;
 
     for attempt in 0..MAX_RETRIES {
-        match try_input_text_and_submit(page, "input[name='loginfmt']", &username, "username").await {
+        match try_input_text_and_submit(page, "input[name='loginfmt']", &username, "username").await
+        {
             Ok(_) => break,
             Err(e) if attempt < MAX_RETRIES - 1 => {
                 tracing::debug!("Attempt {} failed: {}, retrying...", attempt + 1, e);
@@ -268,7 +292,10 @@ async fn handle_username_input(page: &Page, context: &LoginContext) -> Result<()
     while elapsed < TRANSITION_TIMEOUT_MS {
         // Check if username field is no longer visible
         if !is_element_visible(page, "input[name='loginfmt']").await {
-            tracing::debug!("Username field hidden, page transition detected after {}ms", elapsed);
+            tracing::debug!(
+                "Username field hidden, page transition detected after {}ms",
+                elapsed
+            );
             break;
         }
 
@@ -277,7 +304,10 @@ async fn handle_username_input(page: &Page, context: &LoginContext) -> Result<()
     }
 
     if elapsed >= TRANSITION_TIMEOUT_MS {
-        tracing::warn!("Username field still visible after {}ms, proceeding anyway", elapsed);
+        tracing::warn!(
+            "Username field still visible after {}ms, proceeding anyway",
+            elapsed
+        );
     }
 
     // Additional small delay to ensure next page is ready
@@ -320,7 +350,12 @@ async fn try_input_text(page: &Page, selector: &str, text: &str, field_name: &st
 }
 
 /// Helper function to input text and submit by pressing Enter
-async fn try_input_text_and_submit(page: &Page, selector: &str, text: &str, field_name: &str) -> Result<()> {
+async fn try_input_text_and_submit(
+    page: &Page,
+    selector: &str,
+    text: &str,
+    field_name: &str,
+) -> Result<()> {
     try_input_text(page, selector, text, field_name).await?;
 
     // Press Enter to submit instead of clicking submit button (more reliable)
@@ -422,7 +457,10 @@ async fn handle_password_input(page: &Page, context: &LoginContext) -> Result<()
         if !is_element_visible(page, "input[name='Password']").await
             && !is_element_visible(page, "input[name='passwd']").await
         {
-            tracing::debug!("Password field hidden, page transition detected after {}ms", elapsed);
+            tracing::debug!(
+                "Password field hidden, page transition detected after {}ms",
+                elapsed
+            );
             break;
         }
 
@@ -431,7 +469,10 @@ async fn handle_password_input(page: &Page, context: &LoginContext) -> Result<()
     }
 
     if elapsed >= TRANSITION_TIMEOUT_MS {
-        tracing::warn!("Password field still visible after {}ms, proceeding anyway", elapsed);
+        tracing::warn!(
+            "Password field still visible after {}ms, proceeding anyway",
+            elapsed
+        );
     }
 
     // Additional small delay to ensure next page is ready
@@ -484,7 +525,11 @@ async fn handle_account_selection(page: &Page, context: &LoginContext) -> Result
             .interact()
             .map_err(|e| AzureLoginError::AuthenticationFailed(e.to_string()))?;
 
-        let selector = if selection == 0 { "#aadTile" } else { "#msaTile" };
+        let selector = if selection == 0 {
+            "#aadTile"
+        } else {
+            "#msaTile"
+        };
         let tile = page.find_element(selector).await.map_err(|e| {
             AzureLoginError::BrowserError(format!("Failed to find account tile: {}", e))
         })?;
@@ -501,9 +546,12 @@ async fn handle_account_selection(page: &Page, context: &LoginContext) -> Result
 async fn handle_passwordless_auth(page: &Page) -> Result<()> {
     tracing::debug!("Handling passwordless authentication");
 
-    let button = page.find_element("input[value='Send notification']").await.map_err(|e| {
-        AzureLoginError::BrowserError(format!("Failed to find send notification button: {}", e))
-    })?;
+    let button = page
+        .find_element("input[value='Send notification']")
+        .await
+        .map_err(|e| {
+            AzureLoginError::BrowserError(format!("Failed to find send notification button: {}", e))
+        })?;
 
     button.click().await.map_err(|e| {
         AzureLoginError::BrowserError(format!("Failed to click send notification: {}", e))
@@ -559,9 +607,9 @@ async fn handle_verify_identity(page: &Page, context: &LoginContext) -> Result<(
 
     // Look for available authentication options using multiple selector strategies
     let has_authenticator = page
-            .find_element("div[data-value='PhoneAppNotification']")
-            .await
-            .is_ok()
+        .find_element("div[data-value='PhoneAppNotification']")
+        .await
+        .is_ok()
         || page
             .find_element("[data-value='PhoneAppNotification']")
             .await
@@ -572,17 +620,14 @@ async fn handle_verify_identity(page: &Page, context: &LoginContext) -> Result<(
             .is_ok();
 
     let has_verification_code = page
-            .find_element("div[data-value='PhoneAppOTP']")
-            .await
-            .is_ok()
+        .find_element("div[data-value='PhoneAppOTP']")
+        .await
+        .is_ok()
         || page
             .find_element("[data-value='PhoneAppOTP']")
             .await
             .is_ok()
-        || page
-            .find_element("#idDiv_SAOTCC_Desc_OTP")
-            .await
-            .is_ok();
+        || page.find_element("#idDiv_SAOTCC_Desc_OTP").await.is_ok();
 
     tracing::debug!(
         "Authentication options detected - Authenticator: {}, Verification code: {}",
@@ -689,9 +734,15 @@ async fn handle_verification_code_flow(page: &Page, _context: &LoginContext) -> 
     let mut clicked = false;
     for selector in selectors {
         if let Ok(link) = page.find_element(selector).await {
-            tracing::debug!("Found verification code element with selector: {}", selector);
+            tracing::debug!(
+                "Found verification code element with selector: {}",
+                selector
+            );
             link.click().await.map_err(|e| {
-                AzureLoginError::BrowserError(format!("Failed to click verification code link: {}", e))
+                AzureLoginError::BrowserError(format!(
+                    "Failed to click verification code link: {}",
+                    e
+                ))
             })?;
 
             clicked = true;
@@ -827,7 +878,10 @@ async fn handle_remember_me(page: &Page, context: &LoginContext) -> Result<()> {
             AzureLoginError::BrowserError(format!("Failed to click {}: {}", button_value, e))
         })?;
     } else {
-        tracing::warn!("Remember me button '{}' not found, trying fallback", button_value);
+        tracing::warn!(
+            "Remember me button '{}' not found, trying fallback",
+            button_value
+        );
         // Fallback: try the opposite button
         let fallback_value = if should_remember { "No" } else { "Yes" };
         let fallback_selector = format!("input[value='{}']", fallback_value);

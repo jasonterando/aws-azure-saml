@@ -1,6 +1,6 @@
 use crate::cli::{Cli, LoginMode};
-use crate::error::{AzureLoginError, Result};
 use crate::config::Paths;
+use crate::error::{AzureLoginError, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use futures::StreamExt;
 use std::time::Duration;
@@ -65,7 +65,10 @@ pub async fn launch_browser(options: &BrowserOptions) -> Result<Browser> {
     // Azure SSO
     if options.enable_chrome_seamless_sso {
         args.push(format!("--auth-server-whitelist={}", AZURE_AD_SSO));
-        args.push(format!("--auth-negotiate-delegate-whitelist={}", AZURE_AD_SSO));
+        args.push(format!(
+            "--auth-negotiate-delegate-whitelist={}",
+            AZURE_AD_SSO
+        ));
     }
 
     // GPU

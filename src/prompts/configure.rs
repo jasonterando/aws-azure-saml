@@ -1,6 +1,6 @@
 use crate::config::{AwsConfig, ProfileConfig};
 use crate::error::{AzureLoginError, Result};
-use dialoguer::{Input, Confirm};
+use dialoguer::{Confirm, Input};
 
 pub fn configure_profile(profile_name: &str) -> Result<()> {
     let aws_config = AwsConfig::new();
@@ -122,7 +122,11 @@ pub fn configure_profile(profile_name: &str) -> Result<()> {
         },
         azure_default_duration_hours: Some(default_duration),
         azure_default_remember_me: Some(remember_me.to_string()),
-        region: if region.is_empty() { None } else { Some(region) },
+        region: if region.is_empty() {
+            None
+        } else {
+            Some(region)
+        },
     };
 
     // Save configuration

@@ -122,7 +122,10 @@ region = us-east-1
         section.get("azure_app_id_uri"),
         Some("https://signin.aws.amazon.com/saml")
     );
-    assert_eq!(section.get("azure_default_username"), Some("admin@company.com"));
+    assert_eq!(
+        section.get("azure_default_username"),
+        Some("admin@company.com")
+    );
     assert_eq!(section.get("azure_default_duration_hours"), Some("4"));
     assert_eq!(section.get("region"), Some("us-east-1"));
 }

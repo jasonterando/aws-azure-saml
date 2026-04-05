@@ -1,11 +1,11 @@
 use crate::error::{AzureLoginError, Result};
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
+use chrono::Utc;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::Reader;
 use std::io::Write;
-use chrono::Utc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]

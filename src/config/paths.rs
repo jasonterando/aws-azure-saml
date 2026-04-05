@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use dirs::home_dir;
+use std::path::PathBuf;
 
 pub struct Paths {
     pub aws_dir: PathBuf,
