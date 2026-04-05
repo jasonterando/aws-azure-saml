@@ -9,10 +9,46 @@ pub struct LoginContext {
     pub password: Option<String>,
     pub no_prompt: bool,
     pub remember_me: Option<bool>,
+    pub username_from_config: bool,
 }
 
 // Static flag to track if TFA instructions have been shown
 static TFA_INSTRUCTIONS_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Save a screenshot to the specified filename in the temp directory
+async fn save_debug_screenshot(page: &Page, filename: &str) -> String {
+    let screenshot_path = std::env::temp_dir().join(filename);
+    let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
+
+    tracing::debug!("Attempting to save screenshot to {}", screenshot_path_str);
+
+    match page
+        .screenshot(
+            chromiumoxide::page::ScreenshotParams::builder()
+                .full_page(true)
+                .omit_background(false)
+                .build(),
+        )
+        .await
+    {
+        Ok(screenshot_data) => {
+            if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
+                tracing::warn!(
+                    "Failed to write screenshot to {}: {}",
+                    screenshot_path_str,
+                    e
+                );
+            } else {
+                tracing::info!("Screenshot saved to {}", screenshot_path_str);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to capture screenshot: {}", e);
+        }
+    }
+
+    screenshot_path_str
+}
 
 /// Main state machine loop that handles Azure AD login automation
 pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()> {
@@ -57,43 +93,15 @@ pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()
 
                 // If we've been at AWS endpoint too long without finding the role selection page, something went wrong
                 if aws_endpoint_delay > MAX_AWS_ENDPOINT_DELAY {
-                    // Save screenshot for debugging to temp directory
-                    let screenshot_path = std::env::temp_dir().join("unrecognized-state.png");
-                    let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
-
                     tracing::error!(
                         "Timeout at AWS endpoint after {}ms, saving screenshot",
                         aws_endpoint_delay
                     );
 
-                    // Capture screenshot for debugging
-                    match page
-                        .screenshot(
-                            chromiumoxide::page::ScreenshotParams::builder()
-                                .full_page(true)
-                                .omit_background(false)
-                                .build(),
-                        )
-                        .await
-                    {
-                        Ok(screenshot_data) => {
-                            if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
-                                tracing::warn!(
-                                    "Failed to write screenshot to {}: {}",
-                                    screenshot_path_str,
-                                    e
-                                );
-                            } else {
-                                tracing::info!("Screenshot saved to {}", screenshot_path_str);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to capture screenshot: {}", e);
-                        }
-                    }
+                    let screenshot_path = save_debug_screenshot(page, "unrecognized-state.png").await;
 
                     return Err(AzureLoginError::BrowserError(
-                        format!("Timeout waiting for SAML response at AWS endpoint. The SAML POST may have been missed. Screenshot saved to {}", screenshot_path_str)
+                        format!("Timeout waiting for SAML response at AWS endpoint. The SAML POST may have been missed. Screenshot saved to {}", screenshot_path)
                     ));
                 }
                 continue;
@@ -201,42 +209,14 @@ pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()
         unrecognized_delay += POLL_INTERVAL;
 
         if unrecognized_delay > MAX_UNRECOGNIZED_DELAY {
-            // Save screenshot to temp directory
-            let screenshot_path = std::env::temp_dir().join("unrecognized-state.png");
-            let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
-
             tracing::error!(
                 "Unrecognized page state after {}ms, saving screenshot",
                 unrecognized_delay
             );
 
-            // Capture screenshot for debugging
-            match page
-                .screenshot(
-                    chromiumoxide::page::ScreenshotParams::builder()
-                        .full_page(true)
-                        .omit_background(false)
-                        .build(),
-                )
-                .await
-            {
-                Ok(screenshot_data) => {
-                    if let Err(e) = std::fs::write(&screenshot_path, screenshot_data) {
-                        tracing::warn!(
-                            "Failed to write screenshot to {}: {}",
-                            screenshot_path_str,
-                            e
-                        );
-                    } else {
-                        tracing::info!("Screenshot saved to {}", screenshot_path_str);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to capture screenshot: {}", e);
-                }
-            }
+            let screenshot_path = save_debug_screenshot(page, "unrecognized-state.png").await;
 
-            return Err(AzureLoginError::UnrecognizedPageState(screenshot_path_str));
+            return Err(AzureLoginError::UnrecognizedPageState(screenshot_path));
         }
     }
 }
@@ -416,8 +396,19 @@ async fn handle_password_input(page: &Page, context: &LoginContext) -> Result<()
             "No password provided and --no-prompt is set".to_string(),
         ));
     } else {
+        // Show username in prompt only if it was auto-filled from config
+        let prompt = if context.username_from_config {
+            if let Some(username) = &context.username {
+                format!("Password for {}", username)
+            } else {
+                "Password".to_string()
+            }
+        } else {
+            "Password".to_string()
+        };
+
         Password::new()
-            .with_prompt("Password")
+            .with_prompt(&prompt)
             .interact()
             .map_err(|e| AzureLoginError::AuthenticationFailed(e.to_string()))?
     };
@@ -602,6 +593,19 @@ async fn handle_tfa_instructions_once(page: &Page) -> Result<()> {
 async fn handle_verify_identity(page: &Page, context: &LoginContext) -> Result<()> {
     tracing::debug!("Handling verify your identity options");
 
+    // Execute verification logic and save screenshot on any failure
+    match handle_verify_identity_inner(page, context).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::error!("Verification identity failed: {}, saving screenshot", e);
+            let screenshot_path = save_debug_screenshot(page, "unrecognized-state.png").await;
+            tracing::error!("Screenshot saved to {}", screenshot_path);
+            Err(e)
+        }
+    }
+}
+
+async fn handle_verify_identity_inner(page: &Page, context: &LoginContext) -> Result<()> {
     // Wait a bit for options to fully load
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -925,6 +929,7 @@ mod tests {
             password: Some("password123".to_string()),
             no_prompt: false,
             remember_me: Some(true),
+            username_from_config: false,
         };
 
         assert_eq!(context.username, Some("user@example.com".to_string()));
@@ -940,6 +945,7 @@ mod tests {
             password: None,
             no_prompt: true,
             remember_me: None,
+            username_from_config: false,
         };
 
         assert!(context.username.is_none());
@@ -955,6 +961,7 @@ mod tests {
             password: None,
             no_prompt: false,
             remember_me: Some(false),
+            username_from_config: false,
         };
 
         assert_eq!(context.username, Some("admin@company.com".to_string()));

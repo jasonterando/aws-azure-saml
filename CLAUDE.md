@@ -62,7 +62,7 @@ The codebase follows a modular structure organized by concern:
 ## Important Implementation Details
 
 ### Credential Refresh Logic
-Credentials are only refreshed if expiration time is within 11 minutes, preventing unnecessary authentication requests when running `--all-profiles`.
+Credentials are only refreshed if expiration time is within 11 minutes, preventing unnecessary authentication requests for both single profile and `--all-profiles` modes. Use `--force-refresh` to bypass the expiration check and re-authenticate immediately.
 
 ### Browser Automation Modes
 - **cli** (default): Headless browser, fully automated

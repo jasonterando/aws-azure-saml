@@ -12,7 +12,17 @@ const AWS_SAML_ENDPOINT_GOVCLOUD: &str = "https://signin.amazonaws-us-gov.com/sa
 const AWS_SAML_ENDPOINT_CHINA: &str = "https://signin.amazonaws.cn/saml";
 
 pub async fn login_async(profile_name: &str, cli: &Cli) -> Result<()> {
+    println!("Logging in to profile '{}'...", profile_name);
     tracing::info!("Logging in to profile '{}'", profile_name);
+
+    // Check if credentials are about to expire (unless --force-refresh is set)
+    if !cli.force_refresh && !is_profile_about_to_expire(profile_name)? {
+        println!(
+            "Profile '{}' credentials are still valid (use --force-refresh to re-authenticate)",
+            profile_name
+        );
+        return Ok(());
+    }
 
     // Launch browser
     let browser_options = BrowserOptions::from(cli);
@@ -96,6 +106,7 @@ async fn login_async_with_browser(
         password: profile_config.azure_default_password.clone(),
         no_prompt: cli.no_prompt,
         remember_me,
+        username_from_config: profile_config.azure_default_username.is_some(),
     };
 
     // Set up SAML interceptor with navigation - this ensures the event listener is subscribed before navigation
@@ -164,6 +175,7 @@ async fn intercept_saml_with_navigation(
             password: login_context.password.clone(),
             no_prompt: login_context.no_prompt,
             remember_me: login_context.remember_me,
+            username_from_config: login_context.username_from_config,
         };
         async move { run_state_machine(&page_clone, &context_clone).await }
     });

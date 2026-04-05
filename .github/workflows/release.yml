@@ -329,7 +329,6 @@ jobs:
             ```bash
             # Download and extract (example for Linux x86_64)
             unzip aws-azure-saml-linux-x86_64.zip
-            chmod +x aws-azure-saml
             sudo mv aws-azure-saml /usr/local/bin/
             ```
 
