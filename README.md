@@ -25,12 +25,6 @@ cargo build --release
 
 The binary will be available at `target/release/aws-azure-saml`.
 
-### Using Cargo
-
-```bash
-cargo install aws-azure-saml
-```
-
 ## Requirements
 
 - **Chromium/Chrome**: Must be installed on your system for browser automation
