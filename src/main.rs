@@ -30,8 +30,19 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Run the application
-    let result = run(cli).await;
+    // Set up Ctrl-C handler
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    // Run the application with signal handling
+    let result = tokio::select! {
+        result = run(cli) => result,
+        _ = ctrl_c => {
+            eprintln!("\nReceived interrupt signal, shutting down gracefully...");
+            // Give browser processes a moment to clean up
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            std::process::exit(130); // Standard exit code for SIGINT
+        }
+    };
 
     // Handle errors
     match result {
