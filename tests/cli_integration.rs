@@ -32,8 +32,24 @@ fn test_cli_version() {
     let output = result.unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Should contain version number
-    assert!(stdout.contains("0.1.0"));
+    // Read version from Cargo.toml
+    let cargo_toml = std::fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
+    let version_line = cargo_toml
+        .lines()
+        .find(|line| line.starts_with("version = "))
+        .expect("Failed to find version in Cargo.toml");
+    let version = version_line
+        .split('"')
+        .nth(1)
+        .expect("Failed to parse version");
+
+    // Should contain version number from Cargo.toml
+    assert!(
+        stdout.contains(version),
+        "Version output should contain '{}', but got: {}",
+        version,
+        stdout
+    );
 }
 
 #[test]
