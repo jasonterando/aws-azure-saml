@@ -58,6 +58,12 @@ pub fn set_profile_credentials(profile_name: &str, credentials: &ProfileCredenti
 
     ini.write_to_file(&paths.credentials)
         .map_err(|e| AzureLoginError::IniError(e.to_string()))?;
+
+    println!(
+        "Successfully updated credentials for profile '{}' (expires: {})",
+        profile_name, credentials.aws_expiration
+    );
+
     Ok(())
 }
 

@@ -135,8 +135,6 @@ async fn login_async_with_browser(
     )
     .await?;
 
-    tracing::debug!("Successfully logged in to profile '{}'", profile_name);
-
     Ok(())
 }
 

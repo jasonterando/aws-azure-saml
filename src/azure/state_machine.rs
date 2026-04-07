@@ -15,6 +15,12 @@ pub struct LoginContext {
 // Static flag to track if TFA instructions have been shown
 static TFA_INSTRUCTIONS_SHOWN: AtomicBool = AtomicBool::new(false);
 
+// Static flag to track if voice call waiting message has been shown
+static VOICE_CALL_WAITING_SHOWN: AtomicBool = AtomicBool::new(false);
+
+// Static flag to track if user requested cancellation
+static USER_REQUESTED_CANCEL: AtomicBool = AtomicBool::new(false);
+
 /// Save a screenshot to the specified filename in the temp directory
 async fn save_debug_screenshot(page: &Page, filename: &str) -> String {
     let screenshot_path = std::env::temp_dir().join(filename);
@@ -156,11 +162,36 @@ pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()
             continue;
         }
 
+        // Voice call waiting (check before TFA instructions as they can look similar)
+        // Title: "Approve sign in request", Message: "We're calling your phone..."
+        // Try multiple selectors as the exact IDs may vary
+        if try_selector(page, "#idDiv_SAOTCV_Title").await
+            || try_selector(page, "#idDiv_SAOTCV_Description").await
+            || try_selector(page, "div[data-bind*='voiceCall']").await
+        {
+            tracing::debug!("Found state: voice call waiting");
+            handle_voice_call_waiting(page, context).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
+        // Check for "Approve sign in request" text as a fallback
+        if let Ok(content) = page.content().await {
+            if content.contains("We're calling your phone")
+                || (content.contains("Approve sign in request") && content.contains("calling"))
+            {
+                tracing::debug!("Found state: voice call waiting (via content match)");
+                handle_voice_call_waiting(page, context).await?;
+                unrecognized_delay = 0;
+                continue;
+            }
+        }
+
         // TFA instructions (only triggers if code input not present)
         // This is a transient/informational state - just display and continue polling
         if try_selector(page, "#idDiv_SAOTCAS_Description").await {
             tracing::debug!("Found state: TFA instructions");
-            handle_tfa_instructions_once(page).await?;
+            handle_tfa_instructions_once(page, context).await?;
             unrecognized_delay = 0;
             continue;
         }
@@ -171,6 +202,8 @@ pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()
             || try_selector(page, "#idDiv_SAOTCC_Description").await
             || try_selector(page, "div[data-value='PhoneAppNotification']").await
             || try_selector(page, "div[data-value='PhoneAppOTP']").await
+            || try_selector(page, "div[data-value='OneWaySMS']").await
+            || try_selector(page, "div[data-value='TwoWayVoiceMobile']").await
             || try_selector(page, "#idA_SAOTCC_Resend").await
         {
             tracing::debug!(
@@ -563,10 +596,85 @@ async fn handle_passwordless_auth(page: &Page) -> Result<()> {
     Ok(())
 }
 
+/// Handle voice call waiting (similar to TFA instructions but for voice calls)
+async fn handle_voice_call_waiting(page: &Page, context: &LoginContext) -> Result<()> {
+    // Check if we've already shown the waiting message
+    if VOICE_CALL_WAITING_SHOWN.load(Ordering::Relaxed) {
+        // Already shown, just return and continue polling
+        return Ok(());
+    }
+
+    tracing::debug!("Handling voice call waiting");
+
+    // Mark as shown
+    VOICE_CALL_WAITING_SHOWN.store(true, Ordering::Relaxed);
+
+    // Display the title if present
+    if let Ok(elem) = page.find_element("#idDiv_SAOTCV_Title").await {
+        if let Ok(Some(title)) = elem.inner_text().await {
+            println!("{}", title);
+        }
+    }
+
+    // Display the description if present
+    if let Ok(elem) = page.find_element("#idDiv_SAOTCV_Description").await {
+        if let Ok(Some(description)) = elem.inner_text().await {
+            println!("{}", description);
+        }
+    }
+
+    if context.no_prompt {
+        println!("Waiting for call to be answered (use Ctrl+C to cancel)...");
+    } else {
+        println!("Answer your phone and follow the prompts...");
+    }
+
+    Ok(())
+}
+
 /// Handle TFA instructions (only display once, not on every poll)
-async fn handle_tfa_instructions_once(page: &Page) -> Result<()> {
+async fn handle_tfa_instructions_once(page: &Page, context: &LoginContext) -> Result<()> {
+    // First, check if user has requested cancellation
+    if USER_REQUESTED_CANCEL.load(Ordering::Relaxed) {
+        tracing::debug!("User requested cancellation, looking for fallback link");
+
+        // Try to find and click fallback link
+        // The link text is "I can't use my Microsoft Authenticator app right now"
+        let fallback_selectors = vec![
+            "#signInAnotherWay", // Primary selector (2025+)
+            "a[aria-describedby='idDiv_SAOTCAS_Title idDiv_SAOTCAS_Description']", // Alternative via aria-describedby
+            "#idA_SAOTCS_BeginAuth",              // Legacy selector
+            "a[id*='SAOTCS']",                    // Any link with SAOTCS in ID
+            "a[id*='BeginAuth']",                 // Any link with BeginAuth in ID
+            "#switchToAnotherVerificationOption", // Alternate verification
+            "a[onclick*='BeginAuth']",            // Link with BeginAuth onclick
+            "a[id*='signInAnother']",             // Match variations of signInAnotherWay
+        ];
+
+        for selector in fallback_selectors {
+            if let Ok(elem) = page.find_element(selector).await {
+                tracing::debug!("Found fallback element with selector: {}", selector);
+                if let Ok(Some(text)) = elem.inner_text().await {
+                    tracing::debug!("Fallback link text: '{}'", text);
+                }
+                elem.click().await.map_err(|e| {
+                    AzureLoginError::BrowserError(format!("Failed to click fallback link: {}", e))
+                })?;
+                // Reset the flag after clicking
+                USER_REQUESTED_CANCEL.store(false, Ordering::Relaxed);
+                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                return Ok(());
+            }
+        }
+
+        tracing::warn!("Could not find fallback link, will continue waiting");
+        // Reset flag even if we couldn't find the link
+        USER_REQUESTED_CANCEL.store(false, Ordering::Relaxed);
+    }
+
     // Check if we've already shown the instructions
     if TFA_INSTRUCTIONS_SHOWN.load(Ordering::Relaxed) {
+        // Already shown, just return and continue polling
         return Ok(());
     }
 
@@ -586,6 +694,28 @@ async fn handle_tfa_instructions_once(page: &Page) -> Result<()> {
             println!("Authentication code: {}", code);
         }
     }
+
+    // If in no_prompt mode, just wait for approval
+    if context.no_prompt {
+        println!("Waiting for approval (use Ctrl+C to cancel)...");
+        return Ok(());
+    }
+
+    // Spawn background task to listen for Enter key press
+    println!("Press Enter to use another method, or approve on your phone...");
+
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(|| {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)
+        })
+        .await;
+
+        if result.is_ok() {
+            tracing::debug!("User pressed Enter, setting cancellation flag");
+            USER_REQUESTED_CANCEL.store(true, Ordering::Relaxed);
+        }
+    });
 
     Ok(())
 }
@@ -634,10 +764,29 @@ async fn handle_verify_identity_inner(page: &Page, context: &LoginContext) -> Re
             .is_ok()
         || page.find_element("#idDiv_SAOTCC_Desc_OTP").await.is_ok();
 
+    let has_sms = page
+        .find_element("div[data-value='OneWaySMS']")
+        .await
+        .is_ok()
+        || page.find_element("[data-value='OneWaySMS']").await.is_ok()
+        || page.find_element("#idDiv_SAOTCC_Desc_SMS").await.is_ok();
+
+    let has_voice_call = page
+        .find_element("div[data-value='TwoWayVoiceMobile']")
+        .await
+        .is_ok()
+        || page
+            .find_element("[data-value='TwoWayVoiceMobile']")
+            .await
+            .is_ok()
+        || page.find_element("#idDiv_SAOTCC_Desc_Voice").await.is_ok();
+
     tracing::debug!(
-        "Authentication options detected - Authenticator: {}, Verification code: {}",
+        "Authentication options detected - Authenticator: {}, Verification code: {}, SMS: {}, Voice call: {}",
         has_authenticator,
-        has_verification_code
+        has_verification_code,
+        has_sms,
+        has_voice_call
     );
 
     // If no prompt mode, default to authenticator app if available
@@ -654,11 +803,23 @@ async fn handle_verify_identity_inner(page: &Page, context: &LoginContext) -> Re
 
     // Prompt user to choose authentication method
     let mut options = Vec::new();
+    let mut option_handlers = Vec::new();
+
     if has_authenticator {
         options.push("Approve a request on my Microsoft Authenticator app");
+        option_handlers.push("authenticator");
     }
     if has_verification_code {
         options.push("Use a verification code");
+        option_handlers.push("verification_code");
+    }
+    if has_sms {
+        options.push("Text me a code");
+        option_handlers.push("sms");
+    }
+    if has_voice_call {
+        options.push("Call me");
+        option_handlers.push("voice_call");
     }
 
     if options.is_empty() {
@@ -669,11 +830,15 @@ async fn handle_verify_identity_inner(page: &Page, context: &LoginContext) -> Re
 
     if options.len() == 1 {
         tracing::debug!("Only one authentication option available, using it");
-        if has_authenticator {
-            return handle_authenticator_approval(page).await;
-        } else {
-            return handle_verification_code_flow(page, context).await;
-        }
+        return match option_handlers[0] {
+            "authenticator" => handle_authenticator_approval(page).await,
+            "verification_code" => handle_verification_code_flow(page, context).await,
+            "sms" => handle_sms_flow(page, context).await,
+            "voice_call" => handle_voice_call_flow(page, context).await,
+            _ => Err(AzureLoginError::BrowserError(
+                "Unknown authentication method".to_string(),
+            )),
+        };
     }
 
     // Multiple options - prompt user
@@ -685,10 +850,14 @@ async fn handle_verify_identity_inner(page: &Page, context: &LoginContext) -> Re
         .interact()
         .map_err(|e| AzureLoginError::AuthenticationFailed(format!("Selection failed: {}", e)))?;
 
-    if options[selection].contains("Authenticator") {
-        handle_authenticator_approval(page).await
-    } else {
-        handle_verification_code_flow(page, context).await
+    match option_handlers[selection] {
+        "authenticator" => handle_authenticator_approval(page).await,
+        "verification_code" => handle_verification_code_flow(page, context).await,
+        "sms" => handle_sms_flow(page, context).await,
+        "voice_call" => handle_voice_call_flow(page, context).await,
+        _ => Err(AzureLoginError::BrowserError(
+            "Unknown authentication method selected".to_string(),
+        )),
     }
 }
 
@@ -724,6 +893,8 @@ async fn handle_authenticator_approval(page: &Page) -> Result<()> {
     ))
 }
 
+/// Handle Microsoft Authenticator approval waiting screen
+/// Allows user to cancel by entering nothing, which triggers fallback link
 /// Handle verification code flow (click link, prompt for code, enter code)
 async fn handle_verification_code_flow(page: &Page, _context: &LoginContext) -> Result<()> {
     tracing::debug!("Selecting verification code option");
@@ -765,6 +936,82 @@ async fn handle_verification_code_flow(page: &Page, _context: &LoginContext) -> 
 
     // Now prompt for and enter the verification code
     // This should trigger the existing TFA code input handler on next state machine loop
+    Ok(())
+}
+
+/// Handle SMS text message flow (click link, prompt for code, enter code)
+async fn handle_sms_flow(page: &Page, _context: &LoginContext) -> Result<()> {
+    tracing::debug!("Selecting SMS text message option");
+
+    // Click on "Text me a code" link
+    let selectors = vec![
+        "div[data-value='OneWaySMS']",
+        "[data-value='OneWaySMS']",
+        "#idDiv_SAOTCC_Desc_SMS",
+        "div[role='link'][data-value='OneWaySMS']",
+    ];
+
+    let mut clicked = false;
+    for selector in selectors {
+        if let Ok(link) = page.find_element(selector).await {
+            tracing::debug!("Found SMS element with selector: {}", selector);
+            link.click().await.map_err(|e| {
+                AzureLoginError::BrowserError(format!("Failed to click SMS link: {}", e))
+            })?;
+
+            clicked = true;
+            println!("Sending SMS code...");
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            break;
+        }
+    }
+
+    if !clicked {
+        tracing::warn!("Could not find SMS link to click");
+    }
+
+    // Wait for the code input field to appear
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The code input field should trigger the existing TFA code input handler
+    Ok(())
+}
+
+/// Handle voice call flow (click link, prompt for code, enter code)
+async fn handle_voice_call_flow(page: &Page, _context: &LoginContext) -> Result<()> {
+    tracing::debug!("Selecting voice call option");
+
+    // Click on "Call me" link
+    let selectors = vec![
+        "div[data-value='TwoWayVoiceMobile']",
+        "[data-value='TwoWayVoiceMobile']",
+        "#idDiv_SAOTCC_Desc_Voice",
+        "div[role='link'][data-value='TwoWayVoiceMobile']",
+    ];
+
+    let mut clicked = false;
+    for selector in selectors {
+        if let Ok(link) = page.find_element(selector).await {
+            tracing::debug!("Found voice call element with selector: {}", selector);
+            link.click().await.map_err(|e| {
+                AzureLoginError::BrowserError(format!("Failed to click voice call link: {}", e))
+            })?;
+
+            clicked = true;
+            println!("Initiating voice call...");
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            break;
+        }
+    }
+
+    if !clicked {
+        tracing::warn!("Could not find voice call link to click");
+    }
+
+    // Wait for the code input field to appear
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The code input field should trigger the existing TFA code input handler
     Ok(())
 }
 
