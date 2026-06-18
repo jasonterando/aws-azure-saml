@@ -135,6 +135,14 @@ pub async fn run_state_machine(page: &Page, context: &LoginContext) -> Result<()
             continue;
         }
 
+        // MFA setup
+        if try_selector(page, "#skipMfaRegistrationLink").await {
+            tracing::debug!("Found state: MFA setup");
+            handle_skip_mfa_setup(page).await?;
+            unrecognized_delay = 0;
+            continue;
+        }
+
         // Passwordless authentication
         if try_selector(page, "input[value='Send notification']").await {
             tracing::debug!("Found state: passwordless authentication");
@@ -562,6 +570,27 @@ async fn handle_account_selection(page: &Page, context: &LoginContext) -> Result
             AzureLoginError::BrowserError(format!("Failed to click account: {}", e))
         })?;
     }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
+async fn handle_skip_mfa_setup(page: &Page) -> Result<()> {
+    tracing::debug!("Handling skipping MFA setup");
+
+    let link = page
+        .find_element("#skipMfaRegistrationLink")
+        .await
+        .map_err(|e| {
+            AzureLoginError::BrowserError(format!(
+                "Failed to find skip MFA registration link: {}",
+                e
+            ))
+        })?;
+
+    link.click().await.map_err(|e| {
+        AzureLoginError::BrowserError(format!("Failed to click skip MFA registration link: {}", e))
+    })?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     Ok(())

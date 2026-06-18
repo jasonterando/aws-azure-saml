@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+* Skip MFA setup (click "Not Now")
+
 ## 0.2.0
 
 * Allow hitting Enter to choose alternate authentication methods

@@ -66,15 +66,13 @@ pub fn parse_saml_response(saml_response: &str) -> Result<Vec<AwsRole>> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                if e.name().as_ref() == b"Attribute" {
-                    // Check if this is the Role attribute
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"Name"
-                            && attr.value.as_ref() == b"https://aws.amazon.com/SAML/Attributes/Role"
-                        {
-                            in_role_attribute = true;
-                        }
+            Ok(Event::Start(e)) if e.name().as_ref() == b"Attribute" => {
+                // Check if this is the Role attribute
+                for attr in e.attributes().flatten() {
+                    if attr.key.as_ref() == b"Name"
+                        && attr.value.as_ref() == b"https://aws.amazon.com/SAML/Attributes/Role"
+                    {
+                        in_role_attribute = true;
                     }
                 }
             }
